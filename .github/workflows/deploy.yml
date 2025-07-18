@@ -1,1 +1,78 @@
+name: Deploy Node.js API to AWS Lambda
 
+on:
+  push:
+    branches:
+      - main # Trigger on pushes to the main branch
+
+env:
+  AWS_REGION: us-east-1 # Default AWS region, can be overridden by GitHub secret
+  APP_NAME: HelloWorldApi # Name of your application, matches Terraform default
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC, if you set it up. Otherwise, standard AWS keys.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Use IAM Role for OIDC if possible, otherwise use access key/secret key
+          # For simplicity, this example uses access key/secret key stored as GitHub secrets.
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0 # Specify a compatible Terraform version
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -var="aws_region=${{ env.AWS_REGION }}" -var="app_name=${{ env.APP_NAME }}" -no-color
+        continue-on-error: true # Allow plan to fail if resources already exist
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -var="aws_region=${{ env.AWS_REGION }}" -var="app_name=${{ env.APP_NAME }}" -auto-approve
+
+      - name: Get ECR Repository URL
+        id: get_ecr_repo
+        run: |
+          ECR_REPO_URL=$(terraform output -raw ecr_repository_url)
+          echo "ECR_REPO_URL=$ECR_REPO_URL" >> $GITHUB_ENV
+
+      - name: Get Lambda Function Name
+        id: get_lambda_name
+        run: |
+          LAMBDA_FUNCTION_NAME=$(terraform output -raw lambda_function_name)
+          echo "LAMBDA_FUNCTION_NAME=$LAMBDA_FUNCTION_NAME" >> $GITHUB_ENV
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/${{ env.APP_NAME }}-repo:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/${{ env.APP_NAME }}-repo:$IMAGE_TAG
+
+      - name: Update Lambda function with new image
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --image-uri ${{ env.ECR_REPO_URL }}:latest
